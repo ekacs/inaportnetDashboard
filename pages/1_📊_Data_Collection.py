@@ -1,0 +1,950 @@
+import os
+"""
+pages/1_📊_Data_Collection.py
+Halaman pengumpulan data: scraping Inaportnet, upload file eksternal,
+load dari database SQLite, dan ekspor data.
+"""
+
+import streamlit as st
+import time
+import pandas as pd
+import io
+import zipfile
+from modules.scraper      import run_full_scraping, load_port_reference
+from modules.preprocessing import (
+    preprocess, validate_uploaded_file, drop_unnamed_columns,
+)
+from modules.progress import make_fetch_progress, make_insert_progress, timed_status, fmt_dur, render_load_summary_card
+from modules.database      import (
+    insert_pkk_records, fetch_pkk_records, is_connected,
+    get_database_stats, get_db_status_info, deduplicate_dataframe,
+    delete_all_sqlite_records,
+
+)
+from modules.theme import render_theme_selector
+from modules.ui import page_css, render_sidebar_nav, show_df
+
+# Ekstensi yang boleh ditulis permanen ke ./data saat backup upload.
+# Nombre allowlist, bukan blacklist: file di luar daftar ini hanya dibaca
+# (untuk preview/analisis) tapi tidak pernah dipersist ke disk.
+_ALLOWED_UPLOAD_EXT = {".csv", ".gz", ".parquet", ".xlsx", ".xls", ".zip"}
+
+st.set_page_config(page_title="Data Collection · Inaportnet", page_icon="📊", layout="wide")
+render_theme_selector()
+
+# ── CSS ───────────────────────────────────────────────────────
+# CSS global datang dari modules.ui; blok di bawah hanya gaya khas
+# halaman pengumpulan data (section-header, info-box, stat-pill).
+page_css(
+    extra="""
+.section-header {
+    background: linear-gradient(90deg, #1a4a7a, #2471a3);
+    color: white;
+    padding: 0.7rem 1.2rem;
+    border-radius: 10px;
+    font-size: 1.05rem;
+    font-weight: 600;
+    margin: 1.2rem 0 0.8rem;
+}
+.info-box {
+    background: #eaf3fb;
+    border-left: 4px solid #2471a3;
+    border-radius: 0 8px 8px 0;
+    padding: 0.8rem 1rem;
+    font-size: 0.88rem;
+    color: #1a4a7a;
+}
+.stat-pill {
+    display:inline-block;
+    background:#dbeafe;
+    color:#1e40af;
+    border-radius:20px;
+    padding:2px 12px;
+    font-size:0.82rem;
+    font-weight:600;
+    margin:2px;
+}
+"""
+)
+# ── Sidebar ───────────────────────────────────────────────────
+# Nav link berasal dari modules.ui (satu sumber kebenaran).
+render_sidebar_nav()
+
+with st.sidebar:
+    st.markdown("---")
+    db_info = get_db_status_info()
+    st.markdown("**Status Database**")
+    st.success(f"{db_info['label']}")
+
+
+    if "df" in st.session_state and not st.session_state["df"].empty:
+        st.markdown("**Data Sesi**")
+        st.success(f"✅ {len(st.session_state['df']):,} record")
+
+# ── Header ────────────────────────────────────────────────────
+st.markdown("# 📊 Data Collection")
+st.markdown("Ambil, unggah, atau muat data PKK pelabuhan untuk analisis.")
+
+# ── Load referensi pelabuhan ──────────────────────────────────
+@st.cache_data(show_spinner=False)
+def load_port_ref():
+    df = load_port_reference("data/port_code.xlsx")
+    if df.empty:
+        return pd.DataFrame()
+    df = df.dropna(subset=["KODE"])
+    df["label"] = df["KODE"].astype(str) + " — " + df["PELABUHAN"].astype(str)
+    return df.drop_duplicates(subset=["KODE"]).reset_index(drop=True)
+
+df_port_ref = load_port_ref()
+port_labels  = df_port_ref["label"].tolist() if not df_port_ref.empty else []
+port_code_of = {row["label"]: row["KODE"] for _, row in df_port_ref.iterrows()} if not df_port_ref.empty else {}
+
+# ════════════════════════════════════════════════════════════════
+# TAB LAYOUT
+# ════════════════════════════════════════════════════════════════
+tab_scrape, tab_upload, tab_db, tab_export = st.tabs([
+    "🌐 Scraping",
+    "📁 Upload File",
+    "🗄️ Load dari Database",
+    "💾 Ekspor Data",
+])
+
+# ────────────────────────────────────────────────────────────────
+# TAB 1 — SCRAPING
+# ────────────────────────────────────────────────────────────────
+with tab_scrape:
+    st.markdown('<div class="section-header">⚙️ Konfigurasi Scraping</div>', unsafe_allow_html=True)
+    st.markdown('<div class="info-box">Pilih pelabuhan yang ingin di-scraping. Semakin banyak pelabuhan dan bulan, semakin lama prosesnya.</div>', unsafe_allow_html=True)
+
+    col_cfg1, col_cfg2 = st.columns([3, 1])
+
+    with col_cfg1:
+        selected_labels = st.multiselect(
+            "🏗️ Pilih Pelabuhan",
+            options=port_labels,
+            placeholder="Ketik nama atau kode pelabuhan...",
+            help="Pilih satu atau lebih pelabuhan yang akan di-scraping.",
+        )
+
+    with col_cfg2:
+        year_sel = st.selectbox("📅 Tahun", [2025, 2024], index=0)
+
+    col_ang, col_month = st.columns([1, 2])
+    with col_ang:
+        angkutan_sel = st.multiselect(
+            "🚢 Jenis Angkutan",
+            options=["dn — Domestik", "ln — Luar Negeri"],
+            default=["dn — Domestik"],
+            help="dn = domestik, ln = luar negeri",
+        )
+        angkutan_codes = [x.split(" — ")[0] for x in angkutan_sel]
+
+    with col_month:
+        bulan_range = st.select_slider(
+            "📆 Rentang Bulan",
+            options=list(range(1, 13)),
+            value=(1, 12),
+            format_func=lambda x: ["", "Jan","Feb","Mar","Apr","Mei","Jun",
+                                    "Jul","Agu","Sep","Okt","Nov","Des"][x],
+        )
+        months_list = list(range(bulan_range[0], bulan_range[1] + 1))
+
+    selected_port_codes = [port_code_of[lbl] for lbl in selected_labels if lbl in port_code_of]
+
+    # Estimasi durasi
+    if selected_port_codes and angkutan_codes:
+        n_iter = len(selected_port_codes) * len(angkutan_codes) * len(months_list)
+        est_minutes = round(n_iter * 2.5 / 60, 1)  # ~2.5 detik per iterasi
+        st.info(
+            f"📌 **Estimasi:** {n_iter} iterasi stage 1 "
+            f"(~{est_minutes} menit untuk stage 1). "
+            f"Stage 2 (approval time) bergantung jumlah PKK ditemukan."
+        )
+
+    st.markdown('<div class="section-header">▶ Jalankan Scraping</div>', unsafe_allow_html=True)
+
+    # ── Peringatan navigasi ──────────────────────────────────────
+    st.warning(
+        "⚠️ **Perhatian:** Proses scraping berjalan secara sinkron di halaman ini. "
+        "Jika Anda **berpindah ke halaman lain** saat scraping sedang berlangsung, "
+        "proses akan **otomatis berhenti** dan data yang belum tersimpan akan hilang. "
+        "Tunggu hingga scraping selesai sebelum menavigasi.",
+        icon="🚫",
+    )
+
+    # ── Pilihan storage wajib ──
+    st.markdown("**💾 Simpan hasil scraping ke:**")
+    scrape_save_target = st.radio(
+        "Target penyimpanan",
+        options=["☁️ Supabase Cloud", "📦 SQLite (Lokal)"],
+        horizontal=True,
+        key="scrape_save_target",
+    )
+    scrape_db_source = "supabase" if "Supabase" in scrape_save_target else "sqlite"
+
+    # ── Jika pilih Supabase tapi belum terhubung, minta credential ──
+    if False:
+        st.info("🔗 Masukkan kredensial Supabase untuk melanjutkan.")
+        sb_col1, sb_col2 = st.columns(2)
+        with sb_col1:
+            sb_url = st.text_input("Supabase URL", placeholder="https://xxxxx.supabase.co", key="scrape_sb_url")
+        with sb_col2:
+            sb_key = st.text_input("Supabase Anon Key", type="password", placeholder="eyJhbGci...", key="scrape_sb_key")
+        if sb_url and sb_key:
+            if st.button("🔌 Hubungkan Supabase", key="btn_scrape_sb_connect"):
+                with st.spinner("Menghubungkan..."):
+                    if None:
+                        st.success("✅ Supabase terhubung!")
+                        st.rerun()
+                    else:
+                        st.error("❌ Gagal terhubung. Periksa URL dan Key.")
+        st.stop()
+
+    btn_scrape = st.button(
+        "🚀 Mulai Scraping",
+        type="primary",
+        disabled=(not selected_port_codes or not angkutan_codes),
+    )
+
+    if btn_scrape:
+        if not selected_port_codes:
+            st.toast("❌ Pilih minimal satu pelabuhan.", icon="⚠️")
+            st.error("❌ Pilih minimal satu pelabuhan.")
+        elif not angkutan_codes:
+            st.toast("❌ Pilih minimal satu jenis angkutan.", icon="⚠️")
+            st.error("❌ Pilih minimal satu jenis angkutan.")
+        else:
+            # ── Progress containers ──
+            status_txt     = st.empty()
+            progress_bar   = st.progress(0)
+            info_cols      = st.empty()
+            result_area    = st.empty()
+
+            # ── List log error untuk popup ──
+            scraping_errors = []
+
+            # ── Callbacks (dict-based progress) ──
+            def cb_progress1(info):
+                progress_bar.progress(info["percent"] / 200)  # Stage 1: 0–50%
+
+            def cb_status1(msg):
+                status_txt.info(f"**Stage 1 — Daftar PKK**\n\n{msg}")
+
+            def cb_progress2(info):
+                base = info.get("percent", 0)
+                progress_bar.progress(0.5 + base / 200)  # Stage 2: 50–100%
+                # Tampilkan info box di bawah progress bar
+                info_cols.markdown(
+                    f'<div style="display:flex; gap:1.2rem; flex-wrap:wrap; margin-top:0.5rem; font-size:0.85rem;">'
+                    f'<span style="color:#1a4a7a; font-weight:600;">✅ {info.get("success", 0):,} berhasil</span>'
+                    f'<span style="color:#e74c3c; font-weight:600;">❌ {info.get("errors", 0)} gagal</span>'
+                    f'<span style="color:#6c757d;">⏱ {info.get("elapsed_str", "-")} berlalu</span>'
+                    f'<span style="color:#6c757d;">⏳ Sisa ~{info.get("eta_str", "-")}</span>'
+                    f'<span style="color:#6c757d;">📦 {info.get("pkk_number", "")}</span>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
+            def cb_status2(msg):
+                status_txt.info(f"**Stage 2 — Waktu Approval**\n\n{msg}")
+
+            def cb_error(err_msg):
+                scraping_errors.append(err_msg)
+                st.toast(f"⚠️ {err_msg}")
+
+            # ── Jalankan scraping ──
+            _t_scrape = time.perf_counter()
+            with st.spinner("Scraping sedang berjalan..."):
+                df_raw = run_full_scraping(
+                    port_codes=selected_port_codes,
+                    angkutan=angkutan_codes,
+                    year=year_sel,
+                    months=months_list,
+                    port_ref_path="data/port_code.xlsx",
+                    progress_stage1=cb_progress1,
+                    status_stage1=cb_status1,
+                    progress_stage2=cb_progress2,
+                    status_stage2=cb_status2,
+                    error_callback=cb_error,
+                )
+
+            progress_bar.empty()
+            status_txt.empty()
+            info_cols.empty()
+            st.caption(f"⏱️ Scraping selesai dalam **{fmt_dur(time.perf_counter() - _t_scrape)}**.")
+
+            # Jika ada log error selama proses, tampilkan popup toast rangkuman
+            if scraping_errors:
+                st.toast(f"⚠️ Terdapat {len(scraping_errors)} peringatan/error selama proses scraping.", icon="🚨")
+                with st.expander(f"⚠️ Detail Log Error Scraping ({len(scraping_errors)} item)"):
+                    for err in scraping_errors:
+                        st.markdown(f"- `{err}`")
+
+            if df_raw.empty:
+                st.warning("⚠️ Tidak ada data yang berhasil diambil. Periksa koneksi atau parameter.")
+            else:
+                # Preprocessing & Deduplikasi
+                with timed_status(st, "🧹 Memproses & mendeteksi duplikasi hasil scraping"):
+                    df_processed = preprocess(df_raw)
+                    df_processed, n_dups = deduplicate_dataframe(df_processed)
+
+                st.session_state["df"] = df_processed
+                if n_dups > 0:
+                    st.info(f"🧹 **{n_dups:,} record duplikat** terdeteksi dan dibersihkan dari hasil scraping.")
+                st.success(f"✅ **{len(df_processed):,} record bersih** berhasil diambil dan diproses.")
+                st.toast("✅ Scraping dan pemrosesan data berhasil!", icon="🎉")
+                result_area.dataframe(df_processed.head(10), width="stretch")
+
+                db_target = "SQLite (Lokal)"
+                _ibar, _istatus, _icb, _it0, _idone = make_insert_progress(st, target=db_target)
+                res = insert_pkk_records(df_processed, progress_callback=_icb)
+                if res["success"]:
+                    _idone(res["inserted"], db_target)
+                    st.toast(f"💾 {res['inserted']:,} record tersimpan ke {db_target}.", icon="✅")
+                else:
+                    st.error(f"❌ Gagal menyimpan ke Database: {res['error']}")
+                    st.toast(f"❌ Gagal simpan DB: {res['error']}", icon="❌")
+
+# ────────────────────────────────────────────────────────────────
+# TAB 2 — UPLOAD FILE
+# ────────────────────────────────────────────────────────────────
+with tab_upload:
+    st.markdown('<div class="section-header">📁 Upload Data dari File</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="info-box">Upload file CSV, Excel, Zip, atau Parquet hasil scraping sebelumnya. '
+        'Batas ukuran file hingga <b>500 MB</b>.<br>'
+        '💡 <b>Tips Kecepatan:</b> Kompres file CSV menjadi <code>.zip</code>, <code>.csv.gz</code>, atau format <code>.parquet</code> untuk mempercepat upload hingga <b>10x lebih cepat</b>!<br>'
+        'Kolom minimal: <code>submission</code> dan <code>response</code>, atau <code>approval_minutes</code>.</div>',
+        unsafe_allow_html=True
+    )
+
+    uploaded_file = st.file_uploader(
+        "Pilih file CSV, Excel, Zip, atau Parquet",
+        type=["csv", "xlsx", "xls", "gz", "zip", "parquet"],
+        help="Format yang didukung: .csv, .xlsx, .xls, .gz, .zip, .parquet (Maksimal 500 MB)",
+    )
+
+    if uploaded_file is not None:
+        file_size_mb = round(uploaded_file.size / (1024 * 1024), 2)
+        st.caption(f"📦 Ukuran file: **{file_size_mb} MB**")
+
+        try:
+            parse_status = st.empty()
+            parse_progress = st.progress(0)
+            file_name_lower = uploaded_file.name.lower()
+
+            parse_status.info(f"⏳ Membaca & mendekompresi data ({file_size_mb} MB)...")
+            parse_progress.progress(20)
+
+            # Optimasi Parsing berdasarkan format
+            if file_name_lower.endswith(".zip"):
+                # Ekstraksi file ZIP
+                with zipfile.ZipFile(uploaded_file) as z:
+                    file_list = [f for f in z.namelist() if not f.startswith("__MACOSX") and not f.endswith("/")]
+                    csv_files = [f for f in file_list if f.lower().endswith(".csv")]
+                    parquet_files = [f for f in file_list if f.lower().endswith(".parquet")]
+                    excel_files = [f for f in file_list if f.lower().endswith(".xlsx") or f.lower().endswith(".xls")]
+
+                    parse_progress.progress(50)
+                    if csv_files:
+                        with z.open(csv_files[0]) as f:
+                            df_upload = pd.read_csv(f)
+                    elif parquet_files:
+                        with z.open(parquet_files[0]) as f:
+                            df_upload = pd.read_parquet(f)
+                    elif excel_files:
+                        with z.open(excel_files[0]) as f:
+                            df_upload = pd.read_excel(f)
+                    else:
+                        raise ValueError("Tidak ditemukan file CSV, Parquet, atau Excel di dalam arsip ZIP tersebut.")
+                parse_progress.progress(100)
+            elif file_name_lower.endswith(".parquet"):
+                # Parquet (Format biner sangat cepat)
+                df_upload = pd.read_parquet(uploaded_file)
+                parse_progress.progress(100)
+            elif file_name_lower.endswith(".csv") or file_name_lower.endswith(".gz"):
+                # Gunakan PyArrow engine jika tersedia untuk kecepatan multi-threading maksimal
+                try:
+                    parse_progress.progress(40)
+                    df_upload = pd.read_csv(uploaded_file, engine="pyarrow")
+                    parse_progress.progress(100)
+                except Exception:
+                    # Fallback ke chunk reading jika pyarrow tidak mendukung buffer tertentu
+                    chunks = []
+                    chunk_size = 100_000
+                    chunk_iter = pd.read_csv(uploaded_file, chunksize=chunk_size)
+                    for i, chunk in enumerate(chunk_iter):
+                        chunks.append(chunk)
+                        pct = min(95, int((i + 1) * chunk_size * 100 / (file_size_mb * 50000 + 1)))
+                        parse_progress.progress(pct)
+                    df_upload = pd.concat(chunks, ignore_index=True)
+                    parse_progress.progress(100)
+            else:
+                # Excel
+                df_upload = pd.read_excel(uploaded_file)
+                parse_progress.progress(100)
+
+            # Kolom tanpa header (hasil ekspor Excel) dibuang sebelum apa pun:
+            # isinya tidak dipakai, tapi merusak serialisasi Arrow di st.dataframe.
+            df_upload = drop_unnamed_columns(df_upload)
+
+            parse_status.empty()
+            parse_progress.empty()
+
+            st.success(f"✅ File berhasil dibaca: **{len(df_upload):,} baris × {len(df_upload.columns)} kolom** ({file_size_mb} MB)")
+
+            # Preview
+            with st.expander("🔍 Preview Data (10 baris pertama)", expanded=True):
+                show_df(df_upload.head(10), width="stretch")
+
+            # Validasi
+            validation = validate_uploaded_file(df_upload)
+            if not validation["valid"]:
+                st.error(validation["message"])
+            else:
+                st.info(validation["message"])
+
+                # ── Simpan file asli ke ./data untuk backup lokal ──
+                # Dilakukan SETELAH validasi lulus: nama file disanitasi
+                # (basename) agar tidak bisa menulis keluar folder data/
+                # (path traversal), dan file tidak valid tidak ikut tersimpan.
+                try:
+                    _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                    _data_dir = os.path.abspath(os.path.join(_project_root, "data"))
+                    os.makedirs(_data_dir, exist_ok=True)
+                    _safe_name = os.path.basename(uploaded_file.name).strip() or "upload"
+                    _ext = os.path.splitext(_safe_name)[1].lower()
+                    if _ext not in _ALLOWED_UPLOAD_EXT:
+                        st.warning(
+                            f"⚠️ Ekstensi {_ext!r} tidak diizinkan untuk disimpan; file tidak ditulis ke folder data."
+                        )
+                    else:
+                        _save_path = os.path.join(_data_dir, _safe_name)
+                        # Pastikan hasil join tetap benar-benar di dalam _data_dir.
+                        # commonpath butuh kedua argumen absolut & satu drive.
+                        if os.path.commonpath([_data_dir, os.path.abspath(_save_path)]) != _data_dir:
+                            raise ValueError("Path hasil simpan berada di luar folder data/.")
+                        uploaded_file.seek(0)
+                        with open(_save_path, "wb") as _f:
+                            _f.write(uploaded_file.getvalue())
+                        st.caption(f"💾 File tersimpan: `{_save_path}`")
+                except Exception as _e:
+                    st.warning(f"⚠️ Gagal menyimpan file ke folder data: {_e}")
+                st.markdown("**💾 Simpan hasil upload ke:**")
+                upload_save_target = st.radio(
+                    "Target penyimpanan upload",
+                    options=["☁️ Supabase Cloud", "📦 SQLite (Lokal)"],
+                    horizontal=True,
+                    key="upload_save_target",
+                )
+                upload_db_source = "supabase" if "Supabase" in upload_save_target else "sqlite"
+
+                if False:
+                    st.info("🔗 Masukkan kredensial Supabase untuk melanjutkan.")
+                    ub_col1, ub_col2 = st.columns(2)
+                    with ub_col1:
+                        ub_url = st.text_input("Supabase URL", placeholder="https://xxxxx.supabase.co", key="upload_sb_url")
+                    with ub_col2:
+                        ub_key = st.text_input("Supabase Anon Key", type="password", placeholder="eyJhbGci...", key="upload_sb_key")
+                    if ub_url and ub_key:
+                        if st.button("🔌 Hubungkan Supabase", key="btn_upload_sb_connect"):
+                            with st.spinner("Menghubungkan..."):
+                                if None:
+                                    st.success("✅ Supabase terhubung!")
+                                    st.rerun()
+                                else:
+                                    st.error("❌ Gagal terhubung. Periksa URL dan Key.")
+                    st.stop()
+
+                if st.button("✅ Gunakan Data Ini", type="primary", key="btn_use_upload"):
+                    # Step 1: Preprocessing & Deduplication Progress
+                    proc_status = st.empty()
+                    proc_progress = st.progress(0)
+
+                    proc_status.info("🧹 Memproses data & mendeteksi duplikasi...")
+                    proc_progress.progress(30)
+
+                    if validation["is_raw"]:
+                        df_final = preprocess(df_upload)
+                    else:
+                        df_final = df_upload.copy()
+
+                    # Aliasing kolom penting jika belum ada
+                    if "code" in df_final.columns and "port_code" not in df_final.columns:
+                        df_final["port_code"] = df_final["code"]
+
+                    proc_progress.progress(70)
+                    df_final, n_dups = deduplicate_dataframe(df_final)
+                    proc_progress.progress(100)
+
+                    proc_status.empty()
+                    proc_progress.empty()
+
+                    st.session_state["df"] = df_final
+                    if n_dups > 0:
+                        st.info(f"🧹 **{n_dups:,} record duplikat** dibersihkan dari file.")
+                    st.success(f"✅ **{len(df_final):,} record bersih** siap dianalisis.")
+
+                    db_target = "SQLite (Lokal)"
+                    _ubar, _ustatus, _ucb, _ut0, _udone = make_insert_progress(st, target=db_target)
+
+                    res = insert_pkk_records(df_final, progress_callback=_ucb)
+
+                    if res["success"]:
+                        _udone(res["inserted"], db_target)
+                        st.toast(f"💾 {res['inserted']:,} record tersimpan ke {db_target}.", icon="✅")
+                        # Banner navigasi — data sudah siap untuk halaman analisis
+                        st.markdown("""
+<div style="background:linear-gradient(90deg,#1a4a7a,#2471a3);color:white;padding:1rem 1.2rem;
+            border-radius:10px;margin-top:1rem;font-size:0.95rem;line-height:1.7;">
+🎉 <b>Data berhasil disimpan ke database lokal!</b><br>
+Data kini tersedia di seluruh halaman analisis. Lanjutkan ke:<br>
+&nbsp;&nbsp;🚦 <b>Traffic Overview</b> — volume & tren lalu lintas kapal<br>
+&nbsp;&nbsp;📋 <b>Service Performance</b> — kinerja layanan PKK & SLA<br>
+&nbsp;&nbsp;🗺️ <b>Port Classification</b> — klasifikasi & komparasi pelabuhan<br>
+&nbsp;&nbsp;🛡️ <b>Fraud Risk Screening</b> — deteksi anomali & risiko
+</div>
+""", unsafe_allow_html=True)
+                        st.rerun()
+                    else:
+                        st.error(f"❌ Gagal menyimpan ke Database: {res['error']}")
+
+        except MemoryError:
+            st.error(
+                "❌ **Kehabisan Memori (MemoryError):** File terlalu besar untuk dibaca sekaligus ke RAM. "
+                "Disarankan untuk membagi file menjadi beberapa bagian lebih kecil atau menggunakan format `.csv`."
+            )
+        except Exception as e:
+            st.error(f"❌ **Gagal membaca file:** {e}")
+
+# ────────────────────────────────────────────────────────────────
+# TAB 3 — LOAD DARI SUPABASE
+# ────────────────────────────────────────────────────────────────
+with tab_db:
+    st.markdown('<div class="section-header">🗄️ Muat Data dari Database</div>', unsafe_allow_html=True)
+    db_info = get_db_status_info()
+    st.info(f"ℹ️ **Database Aktif:** {db_info['label']}")
+
+    col_src, col_db1, col_db2, col_db3 = st.columns([1.5, 2, 2, 2])
+
+    with col_src:
+        db_source_options = ["Otomatis"]
+        if False:
+            pass  # Supabase removed
+        db_source_options.append("SQLite (Lokal)")
+
+        db_source = st.selectbox(
+            "🗄️ Sumber Data",
+            options=db_source_options,
+            key="db_source_selector",
+            help="Load dari database SQLite lokal."
+        )
+        db_source_code = None
+        if False:
+            db_source_code = "sqlite"
+        elif db_source == "SQLite (Lokal)":
+            db_source_code = "sqlite"
+
+    with col_db1:
+        year_db = st.selectbox("📅 Tahun", [2025, 2024], key="year_db")
+
+    with col_db2:
+        angkutan_db = st.multiselect(
+            "🚢 Jenis Angkutan",
+            ["dn — Domestik", "ln — Luar Negeri"],
+            default=["dn — Domestik", "ln — Luar Negeri"],
+            key="angkutan_db",
+        )
+        angkutan_db_codes = [x.split(" — ")[0] for x in angkutan_db]
+
+    with col_db3:
+        filter_port_db = st.multiselect(
+            "🏗️ Filter Pelabuhan (opsional)",
+            options=port_labels,
+            placeholder="Kosongkan = semua pelabuhan",
+            key="port_db",
+        )
+        filter_codes_db = [port_code_of[lbl] for lbl in filter_port_db if lbl in port_code_of]
+
+    if st.button("📥 Muat dari Database", type="primary", width="stretch"):
+        actual_source_label = db_source if db_source != "Otomatis" else db_info['short_label']
+        _t0 = time.perf_counter()
+        _bar, _status, _cb_fetch, _, _ = make_fetch_progress(st, label="📥 Memuat")
+        _t_load0 = time.perf_counter()
+
+        def _fmt_dur(sec: float) -> str:
+            return fmt_dur(sec)
+
+        def _cb_wrap(done: int, total: int, phase: str):
+            _cb_fetch(done, total, phase)
+
+        _t_fetch0 = time.perf_counter()
+        df_db = fetch_pkk_records(
+            port_codes=filter_codes_db if filter_codes_db else None,
+            year=year_db,
+            angkutan=angkutan_db_codes if len(angkutan_db_codes) < 2 else None,
+            progress_callback=_cb_wrap,
+            chunk_size=50000,
+        )
+        _dur_fetch = time.perf_counter() - _t_fetch0
+        _bar.progress(1.0, text="⚙️ Preprocessing...")
+        _status.info(f"⚙️ Preprocessing... • ⏱️ {_fmt_dur(time.perf_counter() - _t_load0)}")
+
+        if df_db.empty:
+            st.warning(f"⚠️ Tidak ada data ditemukan di {actual_source_label} dengan filter tersebut.")
+            if db_source_code == "supabase" or (db_source_code is None and False):
+                with st.expander("🔍 Debug: Detail Query Supabase"):
+                    st.code(
+                        f"port_codes: {filter_codes_db if filter_codes_db else '(semua)'}\n"
+                        f"year: {year_db}\n"
+                        f"angkutan: {angkutan_db_codes if len(angkutan_db_codes) < 2 else '(semua)'}\n"
+                        f"source: {db_source_code or 'auto'}"
+                    )
+                    st.caption("Pastikan data di Supabase memiliki kolom 'year' dengan nilai yang sesuai.")
+                    if st.button("🔍 Debug: Lihat Semua Data (Tanpa Filter)", key="debug_sqlite_all"):
+                        _dbar, _dstatus, _d_cb, _dt0, _ddone = make_fetch_progress(st, label="📥 Debug load")
+
+                        df_all = fetch_pkk_records(progress_callback=_d_cb, chunk_size=50000)
+                        if df_all.empty:
+                            _dbar.empty()
+                            _dstatus.warning("⚠️ Tidak ada data di Supabase.")
+                        else:
+                            _ddone(len(df_all), "Supabase")
+                            show_df(df_all.head(5), width="stretch")
+                            if "year" in df_all.columns:
+                                st.write("Nilai 'year' yang ada:", df_all["year"].unique().tolist())
+                            if "angkutan" in df_all.columns:
+                                st.write("Nilai 'angkutan' yang ada:", df_all["angkutan"].unique().tolist())
+        else:
+            _t_prep0 = time.perf_counter()
+            df_db = preprocess(df_db)
+            _dur_prep = time.perf_counter() - _t_prep0
+            _dur_total = time.perf_counter() - _t_load0
+            _rate = (len(df_db) / _dur_total) if _dur_total > 0 else 0
+
+            st.session_state["df"] = df_db
+            st.session_state["last_db_load_info"] = {
+                "records": len(df_db),
+                "source": actual_source_label,
+                "dur_total": _dur_total,
+                "dur_fetch": _dur_fetch,
+                "dur_prep": _dur_prep,
+                "rate": _rate,
+                "year": year_db,
+                "angkutan": angkutan_db,
+                "ports": filter_port_db if filter_port_db else ["Semua Pelabuhan"],
+                "timestamp": time.time(),
+            }
+            _bar.progress(1.0, text="✅ Selesai")
+            _status.success(
+                f"✅ **{len(df_db):,} record** dimuat dari {actual_source_label}"
+                f" dalam **{_fmt_dur(_dur_total)}**."
+            )
+            st.rerun()
+
+    # ── Ringkasan Estimasi Waktu & Status Muat Data ──
+    if st.session_state.get("last_db_load_info"):
+        render_load_summary_card(st, st.session_state["last_db_load_info"])
+
+        st.markdown("##### 🚀 Lanjutkan ke Tahapan Analisis:")
+        nav_c1, nav_c2, nav_c3, nav_c4, nav_c5 = st.columns([1.2, 1.2, 1.2, 1.2, 0.9])
+        with nav_c1:
+            st.page_link("pages/3_🚦_Traffic_Overview.py", label="Traffic Overview", icon="🚦")
+        with nav_c2:
+            st.page_link("pages/4_📋_Service_Performance.py", label="Performance", icon="📋")
+        with nav_c3:
+            st.page_link("pages/5_🗺️_Port_Classification.py", label="Classification", icon="🗺️")
+        with nav_c4:
+            st.page_link("pages/6_🛡️_Fraud_Risk_Screening.py", label="Fraud Screening", icon="🛡️")
+        with nav_c5:
+            if st.button("✕ Tutup Info", key="close_db_load_summary", width="stretch"):
+                st.session_state["last_db_load_info"] = None
+                st.rerun()
+
+        if "df" in st.session_state and st.session_state["df"] is not None and not st.session_state["df"].empty:
+            with st.expander("🔍 Preview Data yang Dimuat", expanded=False):
+                show_df(st.session_state["df"].head(20), width="stretch")
+
+# ── Fitur: Tampilkan file di ./data & Analisis Kualitas Data ──
+    st.markdown("---")
+    st.markdown('<div class="section-header">📁 File Hasil Scraping di Folder Data</div>', unsafe_allow_html=True)
+
+    @st.cache_data(ttl=20, show_spinner=False)
+    def _scan_data_folder_cached(data_dir: str):
+        if not os.path.isdir(data_dir):
+            return []
+        files_data = [f for f in os.listdir(data_dir)
+                      if os.path.isfile(os.path.join(data_dir, f))
+                      and not f.startswith(".")
+                      and f.endswith((".csv", ".xlsx", ".xls", ".parquet"))]
+        info_rows = []
+        import datetime as _dt
+        for fname in sorted(files_data):
+            fpath = os.path.join(data_dir, fname)
+            fsize = os.path.getsize(fpath)
+            ftime = os.path.getmtime(fpath)
+            info_rows.append({
+                "File": fname,
+                "Ukuran": f"{fsize / 1024:.1f} KB" if fsize < 1_048_576 else f"{fsize / 1_048_576:.1f} MB",
+                "Terakhir Diubah": _dt.datetime.fromtimestamp(ftime).strftime("%Y-%m-%d %H:%M"),
+            })
+        return info_rows
+
+    @st.cache_data(show_spinner=False)
+    def _compute_quality_stats_cached(df: pd.DataFrame):
+        err_count = 0
+        null_count = 0
+        dup_count = 0
+        if "submission" in df.columns:
+            err_count += int(df["submission"].isna().sum())
+        if "response" in df.columns:
+            err_count += int(df["response"].isna().sum())
+        if "approval_minutes" in df.columns:
+            err_count += int((df["approval_minutes"] < 0).sum())
+        if "pkk_number" in df.columns:
+            err_count += int(df["pkk_number"].isna().sum() + (df["pkk_number"].str.strip() == "").sum())
+            dup_count = int(df.duplicated(subset=["pkk_number"], keep="first").sum())
+        critical_cols = [c for c in ["submission", "response", "port_code", "pkk_number", "vessel_name"]
+                         if c in df.columns]
+        if critical_cols:
+            null_count = int(df[critical_cols].isna().any(axis=1).sum())
+        return {
+            "total": len(df),
+            "err_count": err_count,
+            "null_count": null_count,
+            "dup_count": dup_count,
+        }
+
+    _data_dir_scan = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
+    _file_info_rows = _scan_data_folder_cached(_data_dir_scan)
+    if _file_info_rows:
+        st.caption(f"Ditemukan **{len(_file_info_rows)} file** di folder `data/`:")
+        st.dataframe(pd.DataFrame(_file_info_rows), width="stretch", hide_index=True)
+    elif os.path.isdir(_data_dir_scan):
+        st.info("📂 Belum ada file CSV/Excel/Parquet di folder `data/`.")
+    else:
+        st.info("📂 Folder `data/` belum tersedia.")
+
+    # ── Analisis Kualitas Data ──
+    if "df" in st.session_state and st.session_state["df"] is not None and not st.session_state["df"].empty:
+        st.markdown("---")
+        st.markdown('<div class="section-header">🔍 Analisis Kualitas Data</div>', unsafe_allow_html=True)
+        _df_quality = st.session_state["df"]
+        _qstats = _compute_quality_stats_cached(_df_quality)
+        _err_count = _qstats["err_count"]
+        _null_count = _qstats["null_count"]
+        _dup_count = _qstats["dup_count"]
+        st.caption(
+            f"📊 Total: **{len(_df_quality):,}** | "
+            f"🚨 Error: **{_err_count:,}** | "
+            f"🚫 Null: **{_null_count:,}** | "
+            f"🔄 Duplikat: **{_dup_count:,}**"
+        )
+
+        qc_col1, qc_col2, qc_col3 = st.columns(3)
+
+        with qc_col1:
+            if st.button("🚨 Lihat Transaksi Error", key="btn_show_errors", width="stretch"):
+                # Transaksi error: baris yang gagal diproses (submission/response tidak valid)
+                _err_mask = pd.Series([False] * len(_df_quality), index=_df_quality.index)
+                if "submission" in _df_quality.columns:
+                    _err_mask |= _df_quality["submission"].isna()
+                if "response" in _df_quality.columns:
+                    _err_mask |= _df_quality["response"].isna()
+                if "approval_minutes" in _df_quality.columns:
+                    _err_mask |= (_df_quality["approval_minutes"] < 0)
+                if "pkk_number" in _df_quality.columns:
+                    _err_mask |= _df_quality["pkk_number"].isna() | (_df_quality["pkk_number"].str.strip() == "")
+                _df_errors = _df_quality[_err_mask]
+                st.session_state["_df_errors"] = _df_errors
+
+            if "_df_errors" in st.session_state and not st.session_state["_df_errors"].empty:
+                _df_errors = st.session_state["_df_errors"]
+                st.warning(f"⚠️ **{len(_df_errors):,} transaksi error** ditemukan.")
+                show_df(_df_errors.head(100), width="stretch", hide_index=True)
+                _err_csv = _df_errors.to_csv(index=False).encode("utf-8")
+                st.download_button("💾 Simpan Transaksi Error (.csv)", _err_csv,
+                                   file_name="transaksi_error.csv", mime="text/csv",
+                                   key="dl_errors")
+
+        with qc_col2:
+            if st.button("🚫 Lihat Transaksi Null", key="btn_show_nulls", width="stretch"):
+                # Transaksi dengan nilai null di kolom kritis
+                _critical_cols = [c for c in ["submission", "response", "port_code", "pkk_number", "vessel_name"]
+                                  if c in _df_quality.columns]
+                _null_mask = _df_quality[_critical_cols].isna().any(axis=1) if _critical_cols else pd.Series([False] * len(_df_quality))
+                _df_nulls = _df_quality[_null_mask]
+                st.session_state["_df_nulls"] = _df_nulls
+
+            if "_df_nulls" in st.session_state and not st.session_state["_df_nulls"].empty:
+                _df_nulls = st.session_state["_df_nulls"]
+                st.warning(f"⚠️ **{len(_df_nulls):,} transaksi dengan nilai null** ditemukan.")
+                show_df(_df_nulls.head(100), width="stretch", hide_index=True)
+                _null_csv = _df_nulls.to_csv(index=False).encode("utf-8")
+                st.download_button("💾 Simpan Transaksi Null (.csv)", _null_csv,
+                                   file_name="transaksi_null.csv", mime="text/csv",
+                                   key="dl_nulls")
+
+        with qc_col3:
+            if st.button("🔄 Lihat Duplikat", key="btn_show_dups", width="stretch"):
+                # Duplikat berdasarkan pkk_number
+                _dup_col = "pkk_number" if "pkk_number" in _df_quality.columns else None
+                if _dup_col:
+                    _df_dups = _df_quality[_df_quality.duplicated(subset=[_dup_col], keep="first")]
+                else:
+                    _df_dups = _df_quality[_df_quality.duplicated(keep="first")]
+                st.session_state["_df_dups"] = _df_dups
+
+            if "_df_dups" in st.session_state and not st.session_state["_df_dups"].empty:
+                _df_dups = st.session_state["_df_dups"]
+                st.warning(f"🔄 **{len(_df_dups):,} transaksi duplikat** ditemukan.")
+                show_df(_df_dups.head(100), width="stretch", hide_index=True)
+                _dup_csv = _df_dups.to_csv(index=False).encode("utf-8")
+                st.download_button("💾 Simpan Duplikat (.csv)", _dup_csv,
+                                   file_name="transaksi_duplikat.csv", mime="text/csv",
+                                   key="dl_dups")
+
+        # Ringkasan kualitas
+        _total = len(_df_quality)
+        _n_errors = len(st.session_state.get("_df_errors", pd.DataFrame()))
+        _n_nulls = len(st.session_state.get("_df_nulls", pd.DataFrame()))
+        _n_dups = len(st.session_state.get("_df_dups", pd.DataFrame()))
+        if _n_errors or _n_nulls or _n_dups:
+            _clean = _total - _n_errors - _n_nulls - _n_dups
+            st.info(f"📊 **Ringkasan:** {_total:,} total → {_n_errors:,} error | {_n_nulls:,} null | {_n_dups:,} duplikat | **{max(0, _clean):,} bersih**")
+
+    st.markdown("---")
+    st.markdown('<div class="section-header">🗑️ Hapus Semua Data</div>', unsafe_allow_html=True)
+    st.warning(
+        "⚠️ **Peringatan:** Tindakan ini akan menghapus **SEMUA data** dari database yang dipilih. "
+        "Tindakan ini tidak dapat dibatalkan."
+    )
+
+    del_col1, del_col2 = st.columns(2)
+    with del_col1:
+        del_target = st.radio(
+            "🗄️ Hapus dari:",
+            ["Supabase Cloud", "SQLite (Lokal)"],
+            horizontal=True,
+            key="del_target_radio",
+        )
+    with del_col2:
+        st.markdown("<br>", unsafe_allow_html=True)
+        confirm_del = st.checkbox("Saya yakin ingin menghapus semua data", key="confirm_delete_all")
+
+    if st.button(
+        "🗑️ Hapus Semua Data",
+        type="primary",
+        disabled=not confirm_del,
+        key="btn_delete_all",
+    ):
+        with timed_status(st, f"🗑️ Menghapus semua data dari {del_target}"):
+            if del_target == "Supabase Cloud":
+                res = delete_all_sqlite_records()
+            else:
+                res = delete_all_sqlite_records()
+
+        if res["success"]:
+            st.success(f"✅ **{res.get('deleted', 0):,} record** berhasil dihapus dari {del_target}.")
+            st.toast(f"🗑️ Data di {del_target} berhasil dihapus.", icon="✅")
+        else:
+            st.error(f"❌ Gagal menghapus data: {res.get('error', 'Unknown error')}")
+            st.toast(f"❌ Gagal hapus: {res.get('error', '')}", icon="❌")
+
+# ────────────────────────────────────────────────────────────────
+# TAB 4 — EKSPOR DATA
+# ────────────────────────────────────────────────────────────────
+with tab_export:
+    st.markdown('<div class="section-header">💾 Ekspor Data</div>', unsafe_allow_html=True)
+
+    df_current = st.session_state.get("df", pd.DataFrame())
+
+    if df_current.empty:
+        st.warning("⚠️ Belum ada data di sesi. Silakan ambil atau muat data terlebih dahulu.")
+    else:
+        st.success(f"✅ Data siap diekspor: **{len(df_current):,} record**")
+
+        @st.cache_data(show_spinner=False)
+        def _prepare_csv_export(df: pd.DataFrame) -> bytes:
+            return df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+
+        @st.cache_data(show_spinner=False)
+        def _prepare_excel_export(df: pd.DataFrame) -> bytes:
+            excel_buf = io.BytesIO()
+            with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
+                df.to_excel(writer, sheet_name="Data PKK", index=False)
+                if "port_code" in df.columns and "approval_minutes" in df.columns:
+                    from modules.analysis import compute_port_summary
+                    summary = compute_port_summary(df)
+                    if not summary.empty:
+                        summary.to_excel(writer, sheet_name="Ringkasan Pelabuhan", index=False)
+            return excel_buf.getvalue()
+
+        col_ex1, col_ex2 = st.columns(2)
+
+        # Export CSV
+        with col_ex1:
+            st.markdown("#### 📄 Export CSV")
+            st.caption(f"Format teks CSV cepat & kompatibel dengan berbagai tools spreadsheet/analisis. Estimasi: **~0.5–1 detik** ({len(df_current):,} record).")
+            if st.session_state.get("_csv_cache_len") != len(df_current):
+                st.session_state["_ready_csv"] = False
+
+            if not st.session_state.get("_ready_csv"):
+                if st.button("📄 Siapkan File CSV", key="btn_prep_csv", width="stretch"):
+                    _t_csv0 = time.perf_counter()
+                    with st.spinner("📄 Mengonversi dataset ke format CSV (UTF-8)..."):
+                        st.session_state["_csv_bytes"] = _prepare_csv_export(df_current)
+                        st.session_state["_csv_cache_len"] = len(df_current)
+                        st.session_state["_csv_dur"] = time.perf_counter() - _t_csv0
+                        st.session_state["_ready_csv"] = True
+                        st.rerun()
+            else:
+                _dur_csv_str = f" dalam {st.session_state.get('_csv_dur', 0.5):.2f} dtk" if "_csv_dur" in st.session_state else ""
+                st.success(f"✅ File CSV siap diunduh{_dur_csv_str} ({len(st.session_state.get('_csv_bytes', b'')) / 1024 / 1024:.2f} MB)")
+                st.download_button(
+                    label="⬇️ Download CSV",
+                    data=st.session_state["_csv_bytes"],
+                    file_name="inaportnet_pkk_2025.csv",
+                    mime="text/csv",
+                    width="stretch",
+                )
+
+        # Export Excel
+        with col_ex2:
+            st.markdown("#### 📊 Export Excel")
+            st.caption(f"File Excel menyertakan lembar Data PKK dan Ringkasan Pelabuhan. Estimasi: **~2–5 detik** ({len(df_current):,} record).")
+            if st.session_state.get("_excel_cache_len") != len(df_current):
+                st.session_state["_ready_excel"] = False
+
+            if not st.session_state.get("_ready_excel"):
+                if st.button("📊 Siapkan File Excel", key="btn_prep_excel", width="stretch"):
+                    _t_xls0 = time.perf_counter()
+                    with st.spinner("📊 Menyusun berkas Excel terstruktur (openpyxl)..."):
+                        st.session_state["_excel_bytes"] = _prepare_excel_export(df_current)
+                        st.session_state["_excel_cache_len"] = len(df_current)
+                        st.session_state["_excel_dur"] = time.perf_counter() - _t_xls0
+                        st.session_state["_ready_excel"] = True
+                        st.rerun()
+            else:
+                _dur_xls_str = f" dalam {st.session_state.get('_excel_dur', 2.0):.2f} dtk" if "_excel_dur" in st.session_state else ""
+                st.success(f"✅ File Excel siap diunduh{_dur_xls_str} ({len(st.session_state.get('_excel_bytes', b'')) / 1024 / 1024:.2f} MB)")
+                st.download_button(
+                    label="⬇️ Download Excel (.xlsx)",
+                    data=st.session_state["_excel_bytes"],
+                    file_name="inaportnet_pkk_2025.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    width="stretch",
+                )
+
+        # Preview kolom
+        st.markdown("#### 🔍 Preview Data")
+        show_df(df_current.head(20), width="stretch")
+
+        col_stat1, col_stat2, col_stat3 = st.columns(3)
+        with col_stat1:
+            st.metric("Total Record", f"{len(df_current):,}")
+        with col_stat2:
+            st.metric("Jumlah Kolom", len(df_current.columns))
+        with col_stat3:
+            if "port_code" in df_current.columns:
+                st.metric("Pelabuhan Unik", df_current["port_code"].nunique())

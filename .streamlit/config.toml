@@ -1,0 +1,21 @@
+[theme]
+base = "light"
+primaryColor = "#1a4a7a"
+backgroundColor = "#f8fafc"
+secondaryBackgroundColor = "#ffffff"
+textColor = "#1e293b"
+font = "sans serif"
+
+[server]
+maxUploadSize = 500
+enableWebsocketCompression = true
+fileWatcherType = "none"
+
+[runner]
+fastReruns = true
+
+[browser]
+gatherUsageStats = false
+
+[client]
+showSidebarNavigation = false
